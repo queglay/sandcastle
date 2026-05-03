@@ -68,36 +68,44 @@ if ! git diff --quiet || ! git diff --cached --quiet; then
 fi
 
 
-# ── Harness lifecycle mode detection ─────────────────────────────────────────
-# Two scenarios:
-#   1. --harness-branch <name>: validation mode. Check out <name>, run agent
-#      against it; on success fast-forward main onto <name>.
-#   2. Issue labelled `harness-change`: hold mode. Land work on a holding
-#      branch instead of merging to main; operator validates later.
-HARNESS_HOLD_BRANCH=""
-HARNESS_MODE=""
+MAX_ATTEMPTS=3
+attempt=0
+while : ; do
+    attempt=$((attempt + 1))
+    echo "==> Attempt ${attempt}/${MAX_ATTEMPTS}: launching Sandcastle..."
+    set +e
+    npx tsx .sandcastle/main.ts
+    sandcastle_status=$?
+    set -e
 
-if [ -n "${HARNESS_VALIDATE_BRANCH}" ]; then
-    if ! git show-ref --verify --quiet "refs/heads/${HARNESS_VALIDATE_BRANCH}"; then
-        echo "Error: harness branch '${HARNESS_VALIDATE_BRANCH}' does not exist." >&2
-        exit 1
-    fi
-    echo "==> Validation mode: checking out ${HARNESS_VALIDATE_BRANCH}"
-    git checkout "${HARNESS_VALIDATE_BRANCH}"
-    HARNESS_MODE="validate"
-else
-    issue_num_for_label=$(grep -oE 'gh issue view [0-9]+' "$REPO_ROOT/.sandcastle/prompt.md" | head -1 | grep -oE '[0-9]+' || true)
-    if [ -n "$issue_num_for_label" ]; then
-        labels=$(gh issue view "$issue_num_for_label" --json labels --jq '[.labels[].name] | join(",")' 2>/dev/null || true)
-        if echo ",${labels}," | grep -q ',harness-change,'; then
-            HARNESS_HOLD_BRANCH="sandcastle-harness-pending-$(date +%Y%m%d-%H%M%S)"
-            HARNESS_MODE="hold"
-            export SANDCASTLE_HARNESS_PENDING_BRANCH="${HARNESS_HOLD_BRANCH}"
-            echo "==> Harness change detected (issue #${issue_num_for_label} labelled 'harness-change')."
-            echo "    main.ts will land work on holding branch: ${HARNESS_HOLD_BRANCH}"
+    after_head=$(git rev-parse HEAD)
+    if [ "${HARNESS_MODE}" = "hold" ]; then
+        if git show-ref --verify --quiet "refs/heads/${HARNESS_HOLD_BRANCH}" \
+            && [ "$(git rev-list "main..${HARNESS_HOLD_BRANCH}" --count 2>/dev/null || echo 0)" -gt 0 ]; then
+            break
+        fi
+    else
+        if [ "$after_head" != "$before_head" ]; then
+            break
         fi
     fi
-fi
+
+    latest_log=$(ls -t "$REPO_ROOT/.sandcastle/logs/"main-*.log 2>/dev/null | head -1)
+    if [ -n "$latest_log" ] && grep -q "<promise>BLOCKED</promise>" "$latest_log"; then
+        echo "==> Agent signaled BLOCKED — not retrying. See ${latest_log}."
+        exit 0
+    fi
+
+    if [ "$attempt" -ge "$MAX_ATTEMPTS" ]; then
+        echo "==> ${MAX_ATTEMPTS} attempts produced no commits and no BLOCKED signal. Giving up." >&2
+        echo "    Latest run log: ${latest_log:-<none>}" >&2
+        exit "${sandcastle_status:-1}"
+    fi
+
+    echo "==> Attempt ${attempt} produced no commits and no BLOCKED signal — likely a transient API/stream failure. Retrying."
+done
+
+ts=$(date +%Y%m%d-%H%M%S)
 
 # ── Allow-list scope check ────────────────────────────────────────────────────
 # Parses `## Allowed paths` (fenced code block of glob patterns) from the
