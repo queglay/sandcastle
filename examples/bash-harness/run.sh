@@ -219,3 +219,65 @@ else
         echo "==> Allow-list check passed (issue #${issue_num})."
     fi
 fi
+
+# ── Required-artifact gate ────────────────────────────────────────────────────
+# Parses `## Required artifacts` (fenced code block of filenames, relative to
+# .sandcastle/artifacts/) from the current issue's body and rejects runs where
+# any declared artifact is missing or empty in the work-branch's git tree.
+# Issues without the section are skipped with a warning. Issues with an empty
+# section are skipped silently (templates seed the section empty by default).
+
+if [ -z "$issue_num" ]; then
+    : # already warned during allow-list parse
+elif [ -z "$issue_body" ]; then
+    : # already warned during allow-list parse
+else
+    section_present=$(printf '%s\n' "$issue_body" | grep -c '^## Required artifacts' || true)
+    required_artifacts=$(printf '%s\n' "$issue_body" | awk '
+      /^## Required artifacts/ {found=1; capture=0; next}
+      /^## / {found=0; capture=0; next}
+      found && /^```/ {capture=!capture; next}
+      capture && NF > 0 {print}
+    ')
+
+    if [ "$section_present" = "0" ]; then
+        if [ "$issue_is_afk_ready" = "1" ]; then
+            echo "!! Issue #${issue_num} is labelled 'afk-ready' but has no '## Required artifacts' section." >&2
+            echo "   The required-artifact gate cannot run without it. Refusing to merge." >&2
+            echo "   Fix: edit the issue body to add a fenced '## Required artifacts' block (empty fenced block is fine for issues with no fail-first ACs), then rerun." >&2
+            gate_revert_with_logs "sandcastle-failed-no-artifacts-${ts}"
+            post_revert_comment_and_label "$issue_num" "missing '## Required artifacts' section on afk-ready issue" "sandcastle-failed-no-artifacts-${ts}" "Add a fenced '## Required artifacts' block (empty fenced block is fine if there are no fail-first ACs), then re-run."
+            exit 1
+        fi
+        echo "==> Warning: issue #${issue_num} has no '## Required artifacts' section — artifact check skipped." >&2
+        echo "    Add a fenced '## Required artifacts' block to enforce evidence on future runs." >&2
+    elif [ -z "$required_artifacts" ]; then
+        : # section present but empty body — silent skip
+    else
+        missing_artifacts=()
+        while IFS= read -r artifact_name; do
+            [ -z "$artifact_name" ] && continue
+            artifact_path=".sandcastle/artifacts/${artifact_name}"
+            obj_type=$(git cat-file -t "${WORK_HEAD}:${artifact_path}" 2>/dev/null || echo missing)
+            blob_size=$(git cat-file -s "${WORK_HEAD}:${artifact_path}" 2>/dev/null || echo 0)
+            if [ "${obj_type}" != "blob" ] || [ "${blob_size}" -eq 0 ]; then
+                missing_artifacts+=("${artifact_name}")
+            fi
+        done <<< "$required_artifacts"
+
+        if [ ${#missing_artifacts[@]} -gt 0 ]; then
+            echo
+            echo "!! Required-artifact gate FAILED: agent did not commit non-empty evidence for #${issue_num}. Capturing worktree logs before revert." >&2
+            echo "   Missing or empty (under .sandcastle/artifacts/):" >&2
+            printf '     - %s\n' "${missing_artifacts[@]}" >&2
+            echo
+
+            gate_revert_with_logs "sandcastle-failed-artifacts-${ts}"
+            post_revert_comment_and_label "$issue_num" "missing required artifacts" "sandcastle-failed-artifacts-${ts}" "$(printf 'Missing or empty under .sandcastle/artifacts/:\n%s' "$(printf '- %s\n' "${missing_artifacts[@]}")")"
+            exit 1
+        fi
+
+        artifact_count=$(printf '%s\n' "$required_artifacts" | grep -c .)
+        echo "==> Required-artifact gate passed (issue #${issue_num}, ${artifact_count} declared)."
+    fi
+fi
