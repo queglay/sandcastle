@@ -281,3 +281,75 @@ else
         echo "==> Required-artifact gate passed (issue #${issue_num}, ${artifact_count} declared)."
     fi
 fi
+
+# ── Host test gate ────────────────────────────────────────────────────────────
+# Loads PROJECT_TEST_CMD from .env at repo root (or inherits from environment)
+# and runs the project's test suite on the host against the merged commit(s).
+# On failure: preserve the agent's commits on a backup branch, reset main.
+
+if [ -f "$REPO_ROOT/.env" ]; then
+    set -o allexport
+    source "$REPO_ROOT/.env"
+    set +o allexport
+fi
+
+if [ -z "${PROJECT_TEST_CMD:-}" ]; then
+    echo "Error: PROJECT_TEST_CMD is not set." >&2
+    echo "       Set it in $REPO_ROOT/.env or export it before running run.sh." >&2
+    exit 1
+fi
+
+host_log="$REPO_ROOT/.sandcastle/logs/host-test-${ts}.log"
+mkdir -p "$(dirname "$host_log")"
+
+set +e
+eval "${PROJECT_TEST_CMD}" 2>&1 | tee "$host_log"
+test_status=${PIPESTATUS[0]}
+set -e
+
+if [ "$test_status" -eq 0 ]; then
+    case "${HARNESS_MODE}" in
+        hold)
+            echo
+            echo "============================================================="
+            echo "==> Harness change HELD on branch: ${HARNESS_HOLD_BRANCH}"
+            echo "    main HEAD unchanged: $(git rev-parse --short main)"
+            echo
+            echo "    To validate this harness change:"
+            echo "        ./.sandcastle/run.sh --harness-branch ${HARNESS_HOLD_BRANCH}"
+            echo
+            echo "    First retarget .sandcastle/prompt.md at a benign feature issue."
+            echo "    Successful validation fast-forwards main onto the held branch"
+            echo "    (both harness change and validation feature work)."
+            echo "    NOTE: if your harness change touched .sandcastle/Dockerfile,"
+            echo "    rebuild the image first or the validation runs against stale state."
+            echo "============================================================="
+            exit 0
+            ;;
+        validate)
+            echo "==> Validation gates passed. Fast-forwarding main onto ${HARNESS_VALIDATE_BRANCH}."
+            git checkout main
+            git merge --ff-only "${HARNESS_VALIDATE_BRANCH}"
+            git branch -D "${HARNESS_VALIDATE_BRANCH}"
+            echo "==> main is now at: $(git rev-parse --short HEAD). Run complete."
+            exit 0
+            ;;
+        *)
+            echo "==> Host tests passed. Run complete."
+            if [ -n "$issue_num" ]; then
+                gh issue close "$issue_num" --comment "Closed by Sandcastle: $(git rev-parse HEAD)" || true
+            fi
+            exit 0
+            ;;
+    esac
+fi
+
+echo
+echo "!! Host tests FAILED on the merged commit(s). Capturing worktree logs before revert." >&2
+backup_branch="sandcastle-failed-${ts}"
+gate_revert_with_logs "${backup_branch}"
+echo "   - Test log: ${host_log}" >&2
+if [ -n "$issue_num" ]; then
+    post_revert_comment_and_label "$issue_num" "host tests failed" "$backup_branch" "Test log: \`.sandcastle/logs/$(basename "$host_log")\`"
+fi
+exit 1
