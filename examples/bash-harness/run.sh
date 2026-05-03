@@ -201,6 +201,46 @@ done
 
 ts=$(date +%Y%m%d-%H%M%S)
 
+# Pick the work branch tip that holds Sandcastle's commits, depending on the
+# harness lifecycle mode. In hold mode main HEAD never moved; in validate
+# mode we are checked out on the validate branch and Sandcastle's
+# merge-to-head landed work onto it.
+case "${HARNESS_MODE}" in
+    hold)
+        WORK_BRANCH="${HARNESS_HOLD_BRANCH}"
+        WORK_HEAD=$(git rev-parse "${HARNESS_HOLD_BRANCH}")
+        ;;
+    validate)
+        WORK_BRANCH="${HARNESS_VALIDATE_BRANCH}"
+        WORK_HEAD="${after_head}"
+        ;;
+    *)
+        # If main advanced during the agent's run (operator committed in
+        # parallel), Sandcastle's merge-to-head creates a merge commit
+        # whose second parent is the agent's branch tip. Diffing the
+        # merge commit against before_head sweeps the operator's commits
+        # into the agent's allow-list check and reverts legit work.
+        # Use the agent branch tip directly so concurrent main activity
+        # stays out of scope.
+        if agent_tip=$(git rev-parse --verify "${after_head}^2" 2>/dev/null); then
+            WORK_HEAD="${agent_tip}"
+        else
+            WORK_HEAD="${after_head}"
+        fi
+        WORK_BRANCH=""
+        ;;
+esac
+
+# Diff against the merge-base, not the launcher's pre-run snapshot, so that
+# concurrent commits to the launcher's base branch during the run don't end
+# up in the diff range. The merge-base is where the agent's branch diverged
+# from the base — exactly what scopes the agent's actual edits.
+diff_base=$(git merge-base "${before_head}" "${WORK_HEAD}")
+DIFF_RANGE="${diff_base}..${WORK_HEAD}"
+
+new_commits=$(git rev-list "${DIFF_RANGE}" --count)
+echo "==> Sandcastle produced ${new_commits} commit(s) (${DIFF_RANGE}). Running host gates..."
+
 # ── Allow-list scope check ────────────────────────────────────────────────────
 # Parses `## Allowed paths` (fenced code block of glob patterns) from the
 # current issue's body and rejects diffs that touch files outside that list.
