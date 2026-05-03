@@ -67,6 +67,100 @@ if ! git diff --quiet || ! git diff --cached --quiet; then
     exit 1
 fi
 
+# ── Harness lifecycle mode detection ─────────────────────────────────────────
+# Two scenarios:
+#   1. --harness-branch <name>: validation mode. Check out <name>, run agent
+#      against it; on success fast-forward main onto <name>.
+#   2. Issue labelled `harness-change`: hold mode. Land work on a holding
+#      branch instead of merging to main; operator validates later.
+HARNESS_HOLD_BRANCH=""
+HARNESS_MODE=""
+
+if [ -n "${HARNESS_VALIDATE_BRANCH}" ]; then
+    if ! git show-ref --verify --quiet "refs/heads/${HARNESS_VALIDATE_BRANCH}"; then
+        echo "Error: harness branch '${HARNESS_VALIDATE_BRANCH}' does not exist." >&2
+        exit 1
+    fi
+    echo "==> Validation mode: checking out ${HARNESS_VALIDATE_BRANCH}"
+    git checkout "${HARNESS_VALIDATE_BRANCH}"
+    HARNESS_MODE="validate"
+else
+    issue_num_for_label=$(grep -oE 'gh issue view [0-9]+' "$REPO_ROOT/.sandcastle/prompt.md" | head -1 | grep -oE '[0-9]+' || true)
+    if [ -n "$issue_num_for_label" ]; then
+        labels=$(gh issue view "$issue_num_for_label" --json labels --jq '[.labels[].name] | join(",")' 2>/dev/null || true)
+        if echo ",${labels}," | grep -q ',harness-change,'; then
+            HARNESS_HOLD_BRANCH="sandcastle-harness-pending-$(date +%Y%m%d-%H%M%S)"
+            HARNESS_MODE="hold"
+            export SANDCASTLE_HARNESS_PENDING_BRANCH="${HARNESS_HOLD_BRANCH}"
+            echo "==> Harness change detected (issue #${issue_num_for_label} labelled 'harness-change')."
+            echo "    main.ts will land work on holding branch: ${HARNESS_HOLD_BRANCH}"
+        fi
+    fi
+fi
+
+# gate_revert_with_logs <backup-branch-name>
+#
+# Shared failure path used by every host gate (allow-list violation, missing
+# scope sections, missing artifact sections, missing artifact files,
+# test failure). Copies the agent worktree's .sandcastle/logs/ out to
+# the host (so they survive container teardown), parks the agent's commits
+# on the backup branch, and rewinds main (or restores main in validate
+# mode). Reads ts, REPO_ROOT, WORK_BRANCH, HARNESS_MODE, before_head,
+# after_head from the enclosing scope.
+gate_revert_with_logs() {
+    local backup_branch="$1"
+    local host_logs_out="${REPO_ROOT}/.sandcastle/logs/host-side-${ts}"
+    mkdir -p "${host_logs_out}"
+    local copied_any=0
+    while IFS= read -r wt; do
+      [ "$wt" = "$REPO_ROOT" ] && continue
+      if [ -d "${wt}/.sandcastle/logs" ]; then
+        cp -R "${wt}/.sandcastle/logs/." "${host_logs_out}/" 2>/dev/null || true
+        echo "   - Worktree logs copied from: ${wt}" >&2
+        copied_any=1
+      fi
+    done < <(git worktree list --porcelain | awk '/^worktree /{print substr($0, 10)}')
+    if [ "${copied_any}" = "0" ]; then
+      echo "   - No agent worktree with .sandcastle/logs found (Sandcastle may have already torn it down)." >&2
+    fi
+    if [ -n "${WORK_BRANCH}" ]; then
+        git branch -m "${WORK_BRANCH}" "${backup_branch}"
+        if [ "${HARNESS_MODE}" = "validate" ]; then
+            git checkout main
+        fi
+        echo "   - Failed commits preserved on branch: ${backup_branch}" >&2
+        echo "   - main unchanged at:                  $(git rev-parse --short main)" >&2
+    else
+        git branch "$backup_branch" "$after_head"
+        git reset --hard "$before_head"
+        echo "   - Failed commits preserved on branch: ${backup_branch}" >&2
+        echo "   - main reset to:                      ${before_head:0:10}" >&2
+    fi
+    echo "   To inspect: git log ${backup_branch}" >&2
+    echo "   To recover: git merge ${backup_branch}" >&2
+}
+
+# post_revert_comment_and_label <issue_num> <reason> <backup_branch> <details>
+#
+# Posts a structured diagnostic comment to the GitHub issue and applies the
+# sandcastle-failed label. Called from every revert site so failures are
+# visible on the issue timeline without digging through run logs.
+post_revert_comment_and_label() {
+    local issue_num="$1" reason="$2" backup_branch="$3" details="$4"
+    gh issue comment "$issue_num" --body "$(cat <<EOF
+❌ **Reverted by host gate**.
+**Reason**: $reason
+$details
+
+**Backup branch**: \`$backup_branch\`
+- Inspect: \`git log $backup_branch\`
+- Recover: \`./.sandcastle/recover.sh $backup_branch --note '<reason for override>'\`
+
+To re-run cleanly: fix the issue, then \`./.sandcastle/run.sh\`.
+EOF
+)" || true
+    gh issue edit "$issue_num" --add-label sandcastle-failed || true
+}
 
 MAX_ATTEMPTS=3
 attempt=0
