@@ -67,4 +67,155 @@ if ! git diff --quiet || ! git diff --cached --quiet; then
     exit 1
 fi
 
-# (feature gates added below)
+
+# ── Harness lifecycle mode detection ─────────────────────────────────────────
+# Two scenarios:
+#   1. --harness-branch <name>: validation mode. Check out <name>, run agent
+#      against it; on success fast-forward main onto <name>.
+#   2. Issue labelled `harness-change`: hold mode. Land work on a holding
+#      branch instead of merging to main; operator validates later.
+HARNESS_HOLD_BRANCH=""
+HARNESS_MODE=""
+
+if [ -n "${HARNESS_VALIDATE_BRANCH}" ]; then
+    if ! git show-ref --verify --quiet "refs/heads/${HARNESS_VALIDATE_BRANCH}"; then
+        echo "Error: harness branch '${HARNESS_VALIDATE_BRANCH}' does not exist." >&2
+        exit 1
+    fi
+    echo "==> Validation mode: checking out ${HARNESS_VALIDATE_BRANCH}"
+    git checkout "${HARNESS_VALIDATE_BRANCH}"
+    HARNESS_MODE="validate"
+else
+    issue_num_for_label=$(grep -oE 'gh issue view [0-9]+' "$REPO_ROOT/.sandcastle/prompt.md" | head -1 | grep -oE '[0-9]+' || true)
+    if [ -n "$issue_num_for_label" ]; then
+        labels=$(gh issue view "$issue_num_for_label" --json labels --jq '[.labels[].name] | join(",")' 2>/dev/null || true)
+        if echo ",${labels}," | grep -q ',harness-change,'; then
+            HARNESS_HOLD_BRANCH="sandcastle-harness-pending-$(date +%Y%m%d-%H%M%S)"
+            HARNESS_MODE="hold"
+            export SANDCASTLE_HARNESS_PENDING_BRANCH="${HARNESS_HOLD_BRANCH}"
+            echo "==> Harness change detected (issue #${issue_num_for_label} labelled 'harness-change')."
+            echo "    main.ts will land work on holding branch: ${HARNESS_HOLD_BRANCH}"
+        fi
+    fi
+fi
+
+# ── Allow-list scope check ────────────────────────────────────────────────────
+# Parses `## Allowed paths` (fenced code block of glob patterns) from the
+# current issue's body and rejects diffs that touch files outside that list.
+# Issues filed before this convention was established have no section; we warn
+# and skip enforcement.
+
+issue_num=$(grep -oE 'gh issue view [0-9]+' "$REPO_ROOT/.sandcastle/prompt.md" | head -1 | grep -oE '[0-9]+' || true)
+
+if [ -z "$issue_num" ]; then
+    echo "==> Warning: could not determine issue number from prompt.md; allow-list check skipped." >&2
+else
+    gh label create sandcastle-failed --color "EE0000" --description "Sandcastle run reverted by host gate" 2>/dev/null || true
+    gh label create sandcastle-recovered --color "0E8A16" --description "Sandcastle backup branch manually recovered via recover.sh" 2>/dev/null || true
+
+    issue_body=$(gh issue view "$issue_num" --json body --jq '.body' 2>/dev/null || true)
+    issue_labels=$(gh issue view "$issue_num" --json labels --jq '[.labels[].name] | join(",")' 2>/dev/null || true)
+    case ",${issue_labels}," in
+        *,afk-ready,*) issue_is_afk_ready=1 ;;
+        *)             issue_is_afk_ready=0 ;;
+    esac
+
+    allowed_paths=$(printf '%s\n' "$issue_body" | awk '
+      /^## Allowed paths/ {found=1; capture=0; next}
+      /^## / {found=0; capture=0; next}
+      found && /^```/ {capture=!capture; next}
+      capture && NF > 0 {print}
+    ')
+
+    if [ -z "$allowed_paths" ]; then
+        if [ "$issue_is_afk_ready" = "1" ]; then
+            echo "!! Issue #${issue_num} is labelled 'afk-ready' but has no '## Allowed paths' section." >&2
+            echo "   The allow-list scope check cannot run without it. Refusing to merge." >&2
+            echo "   Fix: edit the issue body to add a fenced '## Allowed paths' block, then rerun." >&2
+            gate_revert_with_logs "sandcastle-failed-no-allowlist-${ts}"
+            post_revert_comment_and_label "$issue_num" "missing '## Allowed paths' section on afk-ready issue" "sandcastle-failed-no-allowlist-${ts}" "Add a fenced '## Allowed paths' block to the issue body, then re-run."
+            exit 1
+        fi
+        echo "==> Warning: issue #${issue_num} has no '## Allowed paths' section — scope check skipped." >&2
+        echo "    Add a fenced '## Allowed paths' block to the issue body to enforce scope on future runs." >&2
+    else
+        # Pre-flight: each literal path's parent directory must exist. The
+        # file itself may be new (slices that legitimately create files), but
+        # the directory anchor must be real — that catches typo'd paths before
+        # the run, while allowing genuinely new files inside existing directories.
+        preflight_violations=()
+        while IFS= read -r p; do
+            [ -z "$p" ] && continue
+            case "$p" in
+                *'*'*|*'?'*|*'['*) continue ;;
+            esac
+            parent_dir=$(dirname "$p")
+            if [ ! -d "$REPO_ROOT/$parent_dir" ]; then
+                preflight_violations+=("$p")
+            fi
+        done <<< "$allowed_paths"
+
+        if [ ${#preflight_violations[@]} -gt 0 ]; then
+            echo "!! Pre-flight: literal path(s) in '## Allowed paths' have non-existent parent directory:" >&2
+            for p in "${preflight_violations[@]}"; do
+                echo "     - $p (parent: $(dirname "$p")/)" >&2
+            done
+            gate_revert_with_logs "sandcastle-failed-preflight-${ts}"
+            post_revert_comment_and_label "$issue_num" "pre-flight: literal path(s) in allow-list have non-existent parent directory" "sandcastle-failed-preflight-${ts}" "$(printf 'Literal path(s) in ## Allowed paths whose parent directory does not exist:\n%s\n\nThe file may be new, but the directory must already exist. Fix the directory portion of the allow-list and re-run.' "$(for p in "${preflight_violations[@]}"; do echo "- \`$p\` (parent \`$(dirname "$p")/\` missing)"; done)")"
+            exit 1
+        fi
+
+        pathspec_args=()
+        while IFS= read -r p; do
+            [ -z "$p" ] && continue
+            pathspec_args+=(":(glob)$p")
+        done <<< "$allowed_paths"
+
+        # Auto-allow `.sandcastle/artifacts/<file>` for every filename declared
+        # in the issue's `## Required artifacts` block. The required-artifact
+        # gate below MANDATES the agent commit those files there; the allow-list
+        # gate must therefore whitelist them implicitly. Without this the two
+        # gates conflict — the agent ships exactly what was asked and gets
+        # reverted.
+        required_artifacts_for_allow=$(printf '%s\n' "$issue_body" | awk '
+          /^## Required artifacts/ {found=1; capture=0; next}
+          /^## / {found=0; capture=0; next}
+          found && /^```/ {capture=!capture; next}
+          capture && NF > 0 {print}
+        ')
+        while IFS= read -r f; do
+            [ -z "$f" ] && continue
+            pathspec_args+=(":(glob).sandcastle/artifacts/$f")
+        done <<< "$required_artifacts_for_allow"
+
+        # Always-allowed auto-generated files. Tooling can regenerate certain
+        # files on every build (e.g. a router's route-tree file), so any slice
+        # that triggers a rebuild would trip the allow-list otherwise.
+        # Populate SANDCASTLE_AUTO_GENERATED_FILES in your .env as a
+        # space-separated list of repo-relative paths.
+        read -ra AUTO_GENERATED_ALLOWED <<< "${SANDCASTLE_AUTO_GENERATED_FILES:-}"
+        for f in "${AUTO_GENERATED_ALLOWED[@]}"; do
+            pathspec_args+=(":(glob)${f}")
+        done
+
+        all_changed=$(git diff --name-only "${DIFF_RANGE}" | sort -u)
+        allowed_changed=$(git diff --name-only "${DIFF_RANGE}" -- "${pathspec_args[@]}" | sort -u)
+        violations=$(comm -23 <(printf '%s\n' "$all_changed") <(printf '%s\n' "$allowed_changed"))
+
+        if [ -n "$violations" ]; then
+            echo
+            echo "!! Allow-list violation: agent edited files outside #${issue_num}'s declared scope. Capturing worktree logs before revert." >&2
+            echo "   Out-of-scope files:" >&2
+            printf '%s\n' "$violations" | sed 's/^/     - /' >&2
+            echo "   Allowed patterns:" >&2
+            printf '%s\n' "$allowed_paths" | sed 's/^/     /' >&2
+            echo
+
+            gate_revert_with_logs "sandcastle-failed-allowlist-${ts}"
+            post_revert_comment_and_label "$issue_num" "allow-list violation" "sandcastle-failed-allowlist-${ts}" "$(printf 'Out-of-scope files:\n%s' "$(printf '%s\n' "$violations" | sed 's/^/- /')")"
+            exit 1
+        fi
+
+        echo "==> Allow-list check passed (issue #${issue_num})."
+    fi
+fi
